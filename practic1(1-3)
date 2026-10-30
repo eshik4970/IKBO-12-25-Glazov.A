@@ -1,0 +1,892 @@
+ПОДГОТОВКА ПРОЕКТА
+mkdir unix_shell_emulator
+cd unix_shell_emulator
+git init
+mkdir src tests scripts vfs
+
+
+ЭТАП 1. REPL
+Цель: интерактивный ввод команд. Реализованы разбор команд и аргументов через shlex, вывод приглашения на основе имени пользователя и имени компьютера, команды ls, cd, exit и сообщения об ошибках. На первом коммите есть базовые классы Shell и VirtualFileSystem.
+Создание файлов:
+  main.py
+  src/__init__.py
+  src/shell.py
+  src/vfs.py
+
+Код src/shell.py на момент первого коммита:
+"""Interactive command interpreter and startup-script runner."""
+
+import getpass
+import shlex
+import socket
+import sys
+from pathlib import Path
+
+from .vfs import VirtualFileSystem
+
+
+class Shell:
+    """A small subset of a UNIX shell that only accesses an in-memory VFS."""
+
+    def __init__(self, vfs, prompt=None, output=None, error=None):
+        self.vfs = vfs
+        self.cwd = "/"
+        self.prompt_override = prompt
+        self.output = output if output is not None else sys.stdout
+        self.error = error if error is not None else sys.stderr
+        self.running = True
+
+    def prompt(self):
+        if self.prompt_override is not None:
+            return self.prompt_override
+        return f"{getpass.getuser()}@{socket.gethostname()}:{self.cwd}$ "
+
+    def execute(self, line):
+        """Execute one command. Return True on success and False on error."""
+        try:
+            args = shlex.split(line, posix=True)
+        except ValueError as exc:
+            print(f"shell: parse error: {exc}", file=self.error)
+            return False
+        if not args:
+            return True
+        name, *parameters = args
+        if name == "exit":
+            if parameters:
+                print("exit: too many arguments", file=self.error)
+                return False
+            self.running = False
+            return True
+        if name == "cd":
+            if len(parameters) > 1:
+                print("cd: too many arguments", file=self.error)
+                return False
+            destination = parameters[0] if parameters else "/"
+            absolute = self.vfs.normalize(destination, self.cwd)
+            entry = self.vfs.get(absolute)
+            if entry is None:
+                print(f"cd: {destination}: no such directory", file=self.error)
+                return False
+            if entry.kind != "dir":
+                print(f"cd: {destination}: not a directory", file=self.error)
+                return False
+            self.cwd = absolute
+            return True
+        if name == "ls":
+            if len(parameters) > 1:
+                print("ls: too many arguments", file=self.error)
+                return False
+            target = parameters[0] if parameters else "."
+            try:
+                print("  ".join(self.vfs.list_dir(target, self.cwd)), file=self.output)
+                return True
+            except FileNotFoundError:
+                print(f"ls: {target}: no such file or directory", file=self.error)
+                return False
+        print(f"{name}: command not found", file=self.error)
+        return False
+
+    def run_script(self, path):
+        """Echo each command, stop on first error, and return its status."""
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not self.running:
+                        break
+                    line = line.rstrip("\r\n")
+                    if not line.strip() or line.lstrip().startswith("#"):
+                        continue
+                    print(f"{self.prompt()}{line}", file=self.output)
+                    self.output.flush()
+                    if not self.execute(line):
+                        return False
+        except (OSError, UnicodeError) as exc:
+            print(f"script: {exc}", file=self.error)
+            return False
+        return True
+
+    def repl(self):
+        while self.running:
+            try:
+                line = input(self.prompt())
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            self.execute(line)
+
+
+Код src/vfs.py на момент первого коммита:
+"""In-memory virtual file system backed by a CSV file."""
+
+import base64
+import csv
+import io
+from dataclasses import dataclass
+from pathlib import PurePosixPath
+
+
+@dataclass(frozen=True)
+class Entry:
+    path: str
+    kind: str
+    content: bytes = b""
+
+
+class VirtualFileSystem:
+    """Read a CSV representation into memory, without modifying the source."""
+
+    def __init__(self, csv_path=None):
+        self.entries = {"/": Entry("/", "dir")}
+        if csv_path is not None:
+            with open(csv_path, "r", encoding="utf-8", newline="") as handle:
+                self.load(handle)
+
+    @staticmethod
+    def normalize(path, cwd="/"):
+        if not path:
+            return cwd
+        combined = path if path.startswith("/") else cwd.rstrip("/") + "/" + path
+        parts = []
+        for part in combined.split("/"):
+            if part in ("", "."):
+                continue
+            if part == "..":
+                if parts:
+                    parts.pop()
+            else:
+                parts.append(part)
+        return "/" + "/".join(parts)
+
+    def load(self, handle):
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None or not {"path", "type", "content_base64"}.issubset(reader.fieldnames):
+            raise ValueError("VFS CSV must have path,type,content_base64 columns")
+        pending = []
+        seen = set()
+        for row in reader:
+            raw = row["path"]
+            if not raw or not raw.startswith("/") or self.normalize(raw) != raw:
+                raise ValueError(f"Invalid absolute VFS path: {raw!r}")
+            kind = row["type"]
+            if kind not in ("file", "dir"):
+                raise ValueError(f"Invalid VFS entry type: {kind!r}")
+            if raw in seen or raw == "/":
+                raise ValueError(f"Duplicate or reserved VFS path: {raw}")
+            seen.add(raw)
+            encoded = row["content_base64"] or ""
+            if kind == "dir" and encoded:
+                raise ValueError(f"Directory cannot contain file data: {raw}")
+            try:
+                content = base64.b64decode(encoded, validate=True) if kind == "file" else b""
+            except (ValueError, base64.binascii.Error) as exc:
+                raise ValueError(f"Invalid base64 for {raw}") from exc
+            pending.append(Entry(raw, kind, content))
+        new_entries = {"/": Entry("/", "dir")}
+        for entry in pending:
+            new_entries[entry.path] = entry
+        for entry in pending:
+            parent = str(PurePosixPath(entry.path).parent)
+            if parent not in new_entries or new_entries[parent].kind != "dir":
+                raise ValueError(f"Missing parent directory for {entry.path}: {parent}")
+        self.entries = new_entries
+
+    def get(self, path, cwd="/"):
+        return self.entries.get(self.normalize(path, cwd))
+
+    def list_dir(self, path, cwd="/"):
+        absolute = self.normalize(path, cwd)
+        entry = self.entries.get(absolute)
+        if entry is None:
+            raise FileNotFoundError(absolute)
+        if entry.kind == "file":
+            return [PurePosixPath(absolute).name]
+        return sorted(PurePosixPath(key).name for key in self.entries
+                      if key != absolute and str(PurePosixPath(key).parent) == absolute)
+
+
+Код main.py на момент первого коммита:
+"""CLI entry point for a UNIX-like shell emulator."""
+
+import argparse
+import sys
+
+from src.shell import Shell
+from src.vfs import VirtualFileSystem
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="In-memory UNIX-like shell emulator")
+    parser.add_argument("--vfs", help="path to a CSV virtual file system")
+    parser.add_argument("--prompt", help="custom shell prompt string")
+    parser.add_argument("--script", help="startup command script")
+    args = parser.parse_args(argv)
+
+    print("Configuration:")
+    print(f"  VFS: {args.vfs if args.vfs is not None else '(empty in-memory VFS)'}")
+    print(f"  Prompt: {args.prompt if args.prompt is not None else '(system default)'}")
+    print(f"  Startup script: {args.script if args.script is not None else '(none)'}")
+    try:
+        vfs = VirtualFileSystem(args.vfs)
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(f"VFS load error: {exc}", file=sys.stderr)
+        return 1
+    shell = Shell(vfs, prompt=args.prompt)
+    if args.script and not shell.run_script(args.script):
+        return 1
+    if shell.running:
+        shell.repl()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+Проверка REPL:
+$ python main.py
+Configuration:
+  VFS: (empty in-memory VFS)
+  Prompt: (system default)
+  Startup script: (none)
+root@2090f83a8ca2:/$ 
+root@2090f83a8ca2:/$ root@2090f83a8ca2:/$ root@2090f83a8ca2:/$ root@2090f83a8ca2:/$ ls: /missing: no such file or directory
+unknown_command: command not found
+[Код завершения: 0]
+
+
+Сохранение этапа 1 в Git:
+git add .
+git commit -m "feat(repl): implement interactive shell with basic commands"
+Фактический коммит: bf856b0
+
+ЭТАП 2. КОНФИГУРАЦИЯ
+Цель: передавать параметры в командной строке и тестировать работу стартового скрипта. Поддержаны --vfs (путь к CSV), --prompt (собственная строка приглашения), --script (путь к стартовому скрипту). При запуске приложение печатает все три параметра. Скрипт показывает ввод и вывод команд, а при ошибке прекращает исполнение и возвращает ненулевой код.
+
+Обновлённый main.py после второго коммита:
+"""CLI entry point for a UNIX-like shell emulator."""
+
+import argparse
+import sys
+
+from src.shell import Shell
+from src.vfs import VirtualFileSystem
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="In-memory UNIX-like shell emulator")
+    parser.add_argument("--vfs", help="path to a CSV virtual file system")
+    parser.add_argument("--prompt", help="custom shell prompt string")
+    parser.add_argument("--script", help="startup command script")
+    args = parser.parse_args(argv)
+
+    print("Configuration:")
+    print(f"  VFS: {args.vfs if args.vfs is not None else '(empty in-memory VFS)'}")
+    print(f"  Prompt: {args.prompt if args.prompt is not None else '(system default)'}")
+    print(f"  Startup script: {args.script if args.script is not None else '(none)'}")
+    try:
+        vfs = VirtualFileSystem(args.vfs)
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(f"VFS load error: {exc}", file=sys.stderr)
+        return 1
+    shell = Shell(vfs, prompt=args.prompt)
+    if args.script and not shell.run_script(args.script):
+        return 1
+    if shell.running:
+        shell.repl()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+Код src/shell.py после второго коммита:
+"""Interactive command interpreter and startup-script runner."""
+
+import getpass
+import shlex
+import socket
+import sys
+from pathlib import Path
+
+from .vfs import VirtualFileSystem
+
+
+class Shell:
+    """A small subset of a UNIX shell that only accesses an in-memory VFS."""
+
+    def __init__(self, vfs, prompt=None, output=None, error=None):
+        self.vfs = vfs
+        self.cwd = "/"
+        self.prompt_override = prompt
+        self.output = output if output is not None else sys.stdout
+        self.error = error if error is not None else sys.stderr
+        self.running = True
+
+    def prompt(self):
+        if self.prompt_override is not None:
+            return self.prompt_override
+        return f"{getpass.getuser()}@{socket.gethostname()}:{self.cwd}$ "
+
+    def execute(self, line):
+        """Execute one command. Return True on success and False on error."""
+        try:
+            args = shlex.split(line, posix=True)
+        except ValueError as exc:
+            print(f"shell: parse error: {exc}", file=self.error)
+            return False
+        if not args:
+            return True
+        name, *parameters = args
+        if name == "exit":
+            if parameters:
+                print("exit: too many arguments", file=self.error)
+                return False
+            self.running = False
+            return True
+        if name == "cd":
+            if len(parameters) > 1:
+                print("cd: too many arguments", file=self.error)
+                return False
+            destination = parameters[0] if parameters else "/"
+            absolute = self.vfs.normalize(destination, self.cwd)
+            entry = self.vfs.get(absolute)
+            if entry is None:
+                print(f"cd: {destination}: no such directory", file=self.error)
+                return False
+            if entry.kind != "dir":
+                print(f"cd: {destination}: not a directory", file=self.error)
+                return False
+            self.cwd = absolute
+            return True
+        if name == "ls":
+            if len(parameters) > 1:
+                print("ls: too many arguments", file=self.error)
+                return False
+            target = parameters[0] if parameters else "."
+            try:
+                print("  ".join(self.vfs.list_dir(target, self.cwd)), file=self.output)
+                return True
+            except FileNotFoundError:
+                print(f"ls: {target}: no such file or directory", file=self.error)
+                return False
+        print(f"{name}: command not found", file=self.error)
+        return False
+
+    def run_script(self, path):
+        """Echo each command, stop on first error, and return its status."""
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not self.running:
+                        break
+                    line = line.rstrip("\r\n")
+                    if not line.strip() or line.lstrip().startswith("#"):
+                        continue
+                    print(f"{self.prompt()}{line}", file=self.output)
+                    self.output.flush()
+                    if not self.execute(line):
+                        return False
+        except (OSError, UnicodeError) as exc:
+            print(f"script: {exc}", file=self.error)
+            return False
+        return True
+
+    def repl(self):
+        while self.running:
+            try:
+                line = input(self.prompt())
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            self.execute(line)
+
+
+Тестовые сценарии:
+
+Файл scripts/success.sh:
+# Commands are shown as if entered interactively.
+ls
+cd docs
+ls
+cd projects
+ls
+cd python
+ls
+cd ..
+cd /
+ls docs
+exit
+
+Файл scripts/error.sh:
+ls
+cd docs
+cd no-such-directory
+ls
+
+Файл scripts/arguments.sh:
+ls /
+cd /docs
+ls projects
+cd ../
+ls missing
+
+
+Тест запуска с конфигурацией и ошибкой в скрипте:
+$ python main.py --prompt student$  --script scripts/error.sh
+Configuration:
+  VFS: (empty in-memory VFS)
+  Prompt: student$ 
+  Startup script: scripts/error.sh
+student$ ls
+
+student$ cd docs
+cd: docs: no such directory
+[Код завершения: 1]
+
+
+Сохранение этапа 2 в Git:
+git add .
+git commit -m "feat(config): add startup scripts and launch helpers"
+Фактический коммит: 246a84d
+
+ЭТАП 3. VFS
+Цель: загрузить файловую структуру из CSV в оперативную память. CSV-колонки: path,type,content_base64. Для файлов контент хранится в формате base64. Использованы csv.DictReader и base64.b64decode(..., validate=True). Проверяется корректность абсолютных путей, повторов, типов, наличия родительских папок и base64. Никаких распаковок или изменений исходных CSV-файлов не производится.
+
+Итоговый файл src/vfs.py:
+"""In-memory virtual file system backed by a CSV file."""
+
+import base64
+import csv
+import io
+from dataclasses import dataclass
+from pathlib import PurePosixPath
+
+
+@dataclass(frozen=True)
+class Entry:
+    path: str
+    kind: str
+    content: bytes = b""
+
+
+class VirtualFileSystem:
+    """Read a CSV representation into memory, without modifying the source."""
+
+    def __init__(self, csv_path=None):
+        self.entries = {"/": Entry("/", "dir")}
+        if csv_path is not None:
+            with open(csv_path, "r", encoding="utf-8", newline="") as handle:
+                self.load(handle)
+
+    @staticmethod
+    def normalize(path, cwd="/"):
+        if not path:
+            return cwd
+        combined = path if path.startswith("/") else cwd.rstrip("/") + "/" + path
+        parts = []
+        for part in combined.split("/"):
+            if part in ("", "."):
+                continue
+            if part == "..":
+                if parts:
+                    parts.pop()
+            else:
+                parts.append(part)
+        return "/" + "/".join(parts)
+
+    def load(self, handle):
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None or not {"path", "type", "content_base64"}.issubset(reader.fieldnames):
+            raise ValueError("VFS CSV must have path,type,content_base64 columns")
+        pending = []
+        seen = set()
+        for row in reader:
+            raw = row["path"]
+            if not raw or not raw.startswith("/") or self.normalize(raw) != raw:
+                raise ValueError(f"Invalid absolute VFS path: {raw!r}")
+            kind = row["type"]
+            if kind not in ("file", "dir"):
+                raise ValueError(f"Invalid VFS entry type: {kind!r}")
+            if raw in seen or raw == "/":
+                raise ValueError(f"Duplicate or reserved VFS path: {raw}")
+            seen.add(raw)
+            encoded = row["content_base64"] or ""
+            if kind == "dir" and encoded:
+                raise ValueError(f"Directory cannot contain file data: {raw}")
+            try:
+                content = base64.b64decode(encoded, validate=True) if kind == "file" else b""
+            except (ValueError, base64.binascii.Error) as exc:
+                raise ValueError(f"Invalid base64 for {raw}") from exc
+            pending.append(Entry(raw, kind, content))
+        new_entries = {"/": Entry("/", "dir")}
+        for entry in pending:
+            new_entries[entry.path] = entry
+        for entry in pending:
+            parent = str(PurePosixPath(entry.path).parent)
+            if parent not in new_entries or new_entries[parent].kind != "dir":
+                raise ValueError(f"Missing parent directory for {entry.path}: {parent}")
+        self.entries = new_entries
+
+    def get(self, path, cwd="/"):
+        return self.entries.get(self.normalize(path, cwd))
+
+    def list_dir(self, path, cwd="/"):
+        absolute = self.normalize(path, cwd)
+        entry = self.entries.get(absolute)
+        if entry is None:
+            raise FileNotFoundError(absolute)
+        if entry.kind == "file":
+            return [PurePosixPath(absolute).name]
+        return sorted(PurePosixPath(key).name for key in self.entries
+                      if key != absolute and str(PurePosixPath(key).parent) == absolute)
+
+
+Итоговый файл src/shell.py:
+"""Interactive command interpreter and startup-script runner."""
+
+import getpass
+import shlex
+import socket
+import sys
+from pathlib import Path
+
+from .vfs import VirtualFileSystem
+
+
+class Shell:
+    """A small subset of a UNIX shell that only accesses an in-memory VFS."""
+
+    def __init__(self, vfs, prompt=None, output=None, error=None):
+        self.vfs = vfs
+        self.cwd = "/"
+        self.prompt_override = prompt
+        self.output = output if output is not None else sys.stdout
+        self.error = error if error is not None else sys.stderr
+        self.running = True
+
+    def prompt(self):
+        if self.prompt_override is not None:
+            return self.prompt_override
+        return f"{getpass.getuser()}@{socket.gethostname()}:{self.cwd}$ "
+
+    def execute(self, line):
+        """Execute one command. Return True on success and False on error."""
+        try:
+            args = shlex.split(line, posix=True)
+        except ValueError as exc:
+            print(f"shell: parse error: {exc}", file=self.error)
+            return False
+        if not args:
+            return True
+        name, *parameters = args
+        if name == "exit":
+            if parameters:
+                print("exit: too many arguments", file=self.error)
+                return False
+            self.running = False
+            return True
+        if name == "cd":
+            if len(parameters) > 1:
+                print("cd: too many arguments", file=self.error)
+                return False
+            destination = parameters[0] if parameters else "/"
+            absolute = self.vfs.normalize(destination, self.cwd)
+            entry = self.vfs.get(absolute)
+            if entry is None:
+                print(f"cd: {destination}: no such directory", file=self.error)
+                return False
+            if entry.kind != "dir":
+                print(f"cd: {destination}: not a directory", file=self.error)
+                return False
+            self.cwd = absolute
+            return True
+        if name == "ls":
+            if len(parameters) > 1:
+                print("ls: too many arguments", file=self.error)
+                return False
+            target = parameters[0] if parameters else "."
+            try:
+                print("  ".join(self.vfs.list_dir(target, self.cwd)), file=self.output)
+                return True
+            except FileNotFoundError:
+                print(f"ls: {target}: no such file or directory", file=self.error)
+                return False
+        print(f"{name}: command not found", file=self.error)
+        return False
+
+    def run_script(self, path):
+        """Echo each command, stop on first error, and return its status."""
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not self.running:
+                        break
+                    line = line.rstrip("\r\n")
+                    if not line.strip() or line.lstrip().startswith("#"):
+                        continue
+                    print(f"{self.prompt()}{line}", file=self.output)
+                    self.output.flush()
+                    if not self.execute(line):
+                        return False
+        except (OSError, UnicodeError) as exc:
+            print(f"script: {exc}", file=self.error)
+            return False
+        return True
+
+    def repl(self):
+        while self.running:
+            try:
+                line = input(self.prompt())
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            self.execute(line)
+
+
+Итоговый файл main.py:
+"""CLI entry point for a UNIX-like shell emulator."""
+
+import argparse
+import sys
+
+from src.shell import Shell
+from src.vfs import VirtualFileSystem
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="In-memory UNIX-like shell emulator")
+    parser.add_argument("--vfs", help="path to a CSV virtual file system")
+    parser.add_argument("--prompt", help="custom shell prompt string")
+    parser.add_argument("--script", help="startup command script")
+    args = parser.parse_args(argv)
+
+    print("Configuration:")
+    print(f"  VFS: {args.vfs if args.vfs is not None else '(empty in-memory VFS)'}")
+    print(f"  Prompt: {args.prompt if args.prompt is not None else '(system default)'}")
+    print(f"  Startup script: {args.script if args.script is not None else '(none)'}")
+    try:
+        vfs = VirtualFileSystem(args.vfs)
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(f"VFS load error: {exc}", file=sys.stderr)
+        return 1
+    shell = Shell(vfs, prompt=args.prompt)
+    if args.script and not shell.run_script(args.script):
+        return 1
+    if shell.running:
+        shell.repl()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+Пример VFS: vfs/minimal.csv
+path,type,content_base64
+/readme.txt,file,SGVsbG8gZnJvbSBhIG1pbmltYWwgVkZT
+
+
+Пример VFS: vfs/multiple.csv
+path,type,content_base64
+/docs,dir,
+/docs/readme.txt,file,RG9jdW1lbnRhdGlvbg==
+/images,dir,
+/images/pixel.bin,file,AAH/
+/notes.txt,file,Tm90ZXM=
+
+
+Пример VFS: vfs/nested.csv
+path,type,content_base64
+/docs,dir,
+/docs/projects,dir,
+/docs/projects/python,dir,
+/docs/projects/python/main.py,file,cHJpbnQoIkhlbGxvLCBWRlMhIikK
+/docs/projects/python/data.bin,file,AAECAwQFBgcICQoLDA0ODw==
+/docs/projects/go,dir,
+/docs/projects/go/main.go,file,cGFja2FnZSBtYWluCg==
+/docs/overview.txt,file,UHJvamVjdCBvdmVydmlldw==
+/tmp,dir,
+
+
+Тест взаимодействия с VFS (каталоги разных уровней):
+$ python main.py --vfs vfs/nested.csv --prompt student$ 
+Configuration:
+  VFS: vfs/nested.csv
+  Prompt: student$ 
+  Startup script: (none)
+student$ docs  tmp
+student$ student$ overview.txt  projects
+student$ student$ go  python
+student$ student$ data.bin  main.py
+student$ student$ overview.txt  projects
+student$ [Код завершения: 0]
+
+
+Тест успешного стартового скрипта:
+$ python main.py --vfs vfs/nested.csv --prompt student$  --script scripts/success.sh
+Configuration:
+  VFS: vfs/nested.csv
+  Prompt: student$ 
+  Startup script: scripts/success.sh
+student$ ls
+docs  tmp
+student$ cd docs
+student$ ls
+overview.txt  projects
+student$ cd projects
+student$ ls
+go  python
+student$ cd python
+student$ ls
+data.bin  main.py
+student$ cd ..
+student$ cd /
+student$ ls docs
+overview.txt  projects
+student$ exit
+[Код завершения: 0]
+
+
+Тест остановки при ошибке:
+$ python main.py --vfs vfs/nested.csv --prompt student$  --script scripts/error.sh
+Configuration:
+  VFS: vfs/nested.csv
+  Prompt: student$ 
+  Startup script: scripts/error.sh
+student$ ls
+docs  tmp
+student$ cd docs
+student$ cd no-such-directory
+cd: no-such-directory: no such directory
+[Код завершения: 1]
+
+
+Тест VFS без указания пути (создание пустой файловой системы в памяти):
+$ python main.py --prompt student$ 
+Configuration:
+  VFS: (empty in-memory VFS)
+  Prompt: student$ 
+  Startup script: (none)
+student$ 
+student$ [Код завершения: 0]
+
+
+Автоматизированные тесты:
+"""Unit tests for command interpretation and script execution."""
+
+import io
+import tempfile
+import unittest
+from pathlib import Path
+
+from src.shell import Shell
+from src.vfs import VirtualFileSystem
+
+
+CSV = """path,type,content_base64
+/docs,dir,
+/docs/a.txt,file,SGVsbG8=
+/docs/deep,dir,
+/docs/deep/b.txt,file,AAEC
+"""
+
+
+class VFSTests(unittest.TestCase):
+    def setUp(self):
+        self.vfs = VirtualFileSystem()
+        self.vfs.load(io.StringIO(CSV))
+
+    def test_files_and_nested_levels(self):
+        self.assertEqual(self.vfs.list_dir("/"), ["docs"])
+        self.assertEqual(self.vfs.list_dir("/docs"), ["a.txt", "deep"])
+        self.assertEqual(self.vfs.get("/docs/a.txt").content, b"Hello")
+        self.assertEqual(self.vfs.get("/docs/deep/b.txt").content, b"\x00\x01\x02")
+
+    def test_normalization(self):
+        self.assertEqual(self.vfs.normalize("../deep/./b.txt", "/docs"), "/deep/b.txt")
+        self.assertEqual(self.vfs.normalize("../../../", "/docs"), "/")
+
+    def test_invalid_parent(self):
+        with self.assertRaises(ValueError):
+            VirtualFileSystem().load(io.StringIO("path,type,content_base64\n/a/b,file,\n"))
+
+    def test_invalid_base64(self):
+        with self.assertRaises(ValueError):
+            VirtualFileSystem().load(io.StringIO("path,type,content_base64\n/a,file,%%%\n"))
+
+
+class ShellTests(unittest.TestCase):
+    def setUp(self):
+        vfs = VirtualFileSystem()
+        vfs.load(io.StringIO(CSV))
+        self.out = io.StringIO()
+        self.err = io.StringIO()
+        self.shell = Shell(vfs, prompt="test$ ", output=self.out, error=self.err)
+
+    def test_cd_and_ls(self):
+        self.assertTrue(self.shell.execute("ls"))
+        self.assertTrue(self.shell.execute("cd docs"))
+        self.assertTrue(self.shell.execute("ls deep"))
+        self.assertEqual(self.shell.cwd, "/docs")
+        self.assertIn("b.txt", self.out.getvalue())
+
+    def test_errors(self):
+        self.assertFalse(self.shell.execute("unknown"))
+        self.assertFalse(self.shell.execute("cd /missing"))
+        self.assertFalse(self.shell.execute("cd /docs/a.txt"))
+        self.assertFalse(self.shell.execute("ls /missing"))
+        self.assertFalse(self.shell.execute("ls 'unclosed"))
+        self.assertFalse(self.shell.execute("cd one two"))
+        self.assertIn("parse error", self.err.getvalue())
+
+    def test_exit(self):
+        self.assertFalse(self.shell.execute("exit 1"))
+        self.assertTrue(self.shell.running)
+        self.assertTrue(self.shell.execute("exit"))
+        self.assertFalse(self.shell.running)
+
+    def test_script_stops_on_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "script.sh"
+            path.write_text("ls\ncd docs\nnot_a_command\ncd deep\n", encoding="utf-8")
+            self.assertFalse(self.shell.run_script(path))
+        self.assertEqual(self.shell.cwd, "/docs")
+        self.assertIn("test$ not_a_command", self.out.getvalue())
+        self.assertNotIn("test$ cd deep", self.out.getvalue())
+
+    def test_script_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "script.sh"
+            path.write_text("exit\nunknown\n", encoding="utf-8")
+            self.assertTrue(self.shell.run_script(path))
+        self.assertFalse(self.shell.running)
+        self.assertNotIn("unknown", self.err.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+Запуск:
+$ python -m unittest discover -s tests -v
+test_cd_and_ls (test_shell.ShellTests.test_cd_and_ls) ... ok
+test_errors (test_shell.ShellTests.test_errors) ... ok
+test_exit (test_shell.ShellTests.test_exit) ... ok
+test_script_exit (test_shell.ShellTests.test_script_exit) ... ok
+test_script_stops_on_error (test_shell.ShellTests.test_script_stops_on_error) ... ok
+test_files_and_nested_levels (test_shell.VFSTests.test_files_and_nested_levels) ... ok
+test_invalid_base64 (test_shell.VFSTests.test_invalid_base64) ... ok
+test_invalid_parent (test_shell.VFSTests.test_invalid_parent) ... ok
+test_normalization (test_shell.VFSTests.test_normalization) ... ok
+
+----------------------------------------------------------------------
+Ran 9 tests in 0.003s
+
+OK
+[Код завершения: 0]
+
+
+Сохранение этапа 3 в Git:
+git add .
+git commit -m "feat(vfs): add CSV virtual file system examples and tests"
+Фактический коммит: d7774d0
