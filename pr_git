@@ -1,0 +1,285 @@
+Задание 1
+Вывести отсортированный в алфавитном порядке список имён пользователей из /etc/passwd.
+Команда: grep -o '^[^:]*' /etc/passwd | sort
+Пояснение: grep -o '^[^:]*' вырезает всё до первого двоеточия (имя пользователя), затем sort сортирует по алфавиту.
+Вывод: labex:project/ $ grep -o '^[^:]*' /etc/passwd | sort
+_apt
+avahi
+backup
+bin
+colord
+daemon
+games
+gnats
+irc
+labex
+list
+lp
+mail
+man
+messagebus
+mongodb
+mysql
+news
+nobody
+proxy
+pulse
+redis
+root
+rtkit
+saned
+sshd
+sync
+sys
+systemd-network
+systemd-resolve
+systemd-timesync
+tcpdump
+usbmux
+uucp
+www-data
+ 
+ 
+Задание 2
+Вывести данные /etc/protocols для 5 наибольших портов в формате «номер протокола» + «имя».
+Команда: grep -v '^#' /etc/protocols | awk '{print $2, $1}' | sort -rn | head -5
+Пояснение: grep -v '^#' убирает строки с комментариями.
+awk '{print $2, $1}' меняет местами номер и имя (в файле сначала имя, потом номер).
+sort -rn сортирует по номеру по убыванию.
+head -5 оставляет первые 5 строк.
+Вывод: 142 rohc
+141 wesp
+140 shim6
+139 hip
+138 manet
+ 
+ 
+Задание 3
+Скрипт banner, который выводит текст в рамке. Размер рамки зависит от длины текста.
+ 
+Файл banner: #!/bin/bash
+ 
+if [ -z "$1" ]; then
+    echo "Usage: $0 <text>"
+    exit 1
+fi
+ 
+text="$1"
+len=${#text}
+# Формируем рамку: '+' + (len+2) дефисов + '+'
+border=$(printf '+%*s+' $((len+2)) | tr ' ' '-')
+ 
+echo "$border"
+echo "| $text |"
+echo "$border"
+ 
+Пояснение: len — длина текста. printf '+%*s+' создаёт строку нужной ширины из пробелов, tr ' ' '-' заменяет их на дефисы. Затем выводим три строки.
+Вывод: После ввода ./banner 'Hello from RTU MIREA!' получаем Hello from RTU MIREA!
+ 
+ 
+Задание 4
+Программа принимает файл и выводит все слова, которые являются идентификаторами в C/C++/Java
+ 
+Файл hello.c: #include <stdio.h>
+int main() {
+    int x = 5;
+    printf("Hello");
+    return 0;
+}
+Файл identifiers: #!/bin/bash
+if [ -z "$1" ]; then
+    echo "Usage: $0 <file>"
+    exit 1
+fi
+grep -oE '\b[A-Za-z_][A-Za-z0-9_]*\b' "$1" | sort -u | tr '\n' ' '
+echo
+ 
+Разбор команды: grep -oE '...' — ищет по регулярному выражению, -o выводит только совпадения
+\b[A-Za-z_][A-Za-z0-9_]*\b — слово, начинающееся с буквы/_, затем буквы/цифры/_
+sort -u — сортировка + удаление дубликатов
+tr '\n' ' ' — переводы строк заменяем на пробелы (вывод в одну строку)
+ 
+nano identifiers
+# (вставить код, Ctrl+O, Enter, Ctrl+X)
+chmod +x identifiers
+ 
+# создаём тестовый файл
+nano hello.c
+# (вставляем пример, сохраняем)
+./identifiers hello.c
+ 
+Запуск: ./identifiers hello.c
+Вывод: h include int main n printf return stdio void world
+ 
+ 
+Задание 5
+Программа reg берёт другой скрипт (например, banner), копирует его в /usr/local/bin и ставит правильные права.
+ 
+Файл reg: #!/bin/bash
+if [ -z "$1" ]; then
+    echo "Usage: $0 <command>"
+    exit 1
+fi
+cmd="$1"
+if [ ! -f "$cmd" ]; then
+    echo "File $cmd not found"
+    exit 1
+fi
+sudo cp "$cmd" /usr/local/bin/
+sudo chmod 755 "/usr/local/bin/$cmd"
+echo "Command $cmd registered in /usr/local/bin"
+ 
+Разбор команды: sudo — потому что /usr/local/bin требует прав root
+cp — копирование
+chmod 755 — владелец: чтение+запись+выполнение, остальные: чтение+выполнение
+ 
+nano reg
+# (вставляем, сохраняем)
+chmod +x reg
+# регистрируем banner
+./reg banner
+# вводим пароль sudo, если попросит
+# проверяем — теперь можно откуда угодно
+cd ~
+banner 'Hello from anywhere!'
+ 
+ 
+Задача 6
+Программа ищет в заданной папке все файлы с расширениями .c, .js, .py и проверяет первую строку.
+ 
+Файл check_comment: #!/bin/bash
+if [ -z "$1" ]; then
+    echo "Usage: $0 <directory>"
+    exit 1
+fi
+find "$1" -type f \( -name "*.c" -o -name "*.js" -o -name "*.py" \) | while read -r file; do
+    first_line=$(head -n 1 "$file")
+    if [[ "$first_line" =~ ^\s*// ]] || [[ "$first_line" =~ ^\s*/\* ]] || [[ "$first_line" =~ ^\s*# ]]; then
+        echo "$file: has comment"
+    else
+        echo "$file: no comment"
+    fi
+done
+ 
+Разбор команды: find "$1" -type f \( -name "*.c" -o -name "*.js" -o -name "*.py" \) — находит все нужные файлы
+head -n 1 — берёт первую строку
+[[ ... =~ ... ]] — проверяет по регулярке
+^\s*// — начало строки, пробелы, потом //
+ 
+nano check_comment
+chmod +x check_comment
+# создаём тестовую папку с файлами
+mkdir testdir
+echo "// комментарий" > testdir/a.c
+echo "int main() {}" > testdir/b.c
+echo "# comment" > testdir/c.py
+./check_comment testdir
+ 
+Вывод: testdir/a.c: has comment
+testdir/b.c: no comment
+testdir/c.py: has comment
+ 
+ 
+Задача 7
+Программа ищет в папке файлы с одинаковым содержимым и выводит их.
+ 
+Файл find_duplicates: #!/bin/bash
+dir="${1:-.}"
+find "$dir" -type f -exec md5sum {} + | sort | uniq -w32 -D
+ 
+Разбор команды: md5sum — считает хеш каждого файла
+sort — сортирует по хешу
+uniq -w32 -D — выводит все строки, где первые 32 символа (хеш) совпадают
+ 
+nano find_duplicates
+chmod +x find_duplicates
+# создаём дубликаты
+mkdir dup_test
+echo "same content" > dup_test/a.txt
+echo "same content" > dup_test/b.txt
+echo "other" > dup_test/c.txt
+./find_duplicates dup_test
+ 
+Вывод: <hash1> dup_test/a.txt
+<hash1> dup_test/b.txt
+ 
+ 
+Задача 8
+Программа берёт папку и расширение, находит все файлы с этим расширением и упаковывает их в tar-архив.
+ 
+Файл archive_ext: #!/bin/bash
+if [ $# -ne 2 ]; then
+    echo "Usage: $0 <directory> <extension>"
+    exit 1
+fi
+dir="$1"
+ext="$2"
+find "$dir" -type f -name "*.$ext" -print0 | tar -cvf archive.tar --null -T -
+ 
+Разбор команды: find ... -name "*.$ext" -print0 — находит файлы, имена разделены нулевым байтом (для пробелов в путях)
+tar -cvf archive.tar --null -T - — создаёт архив archive.tar, читает список из stdin
+ 
+nano archive_ext
+chmod +x archive_ext
+# создаём тестовые файлы
+mkdir arch_test
+echo "1" > arch_test/a.txt
+echo "2" > arch_test/b.txt
+echo "3" > arch_test/c.log
+./archive_ext arch_test txt
+ 
+Вывод: должен появится файл archive.tar внутри — a.txt и b.txt (но не c.log).
+ 
+Проверка: tar -tvf archive.tar
+ 
+ 
+Задача 9
+Программа берёт входной файл и выходной файл. Читает входной, заменяет все последовательности из 4 пробелов на символ табуляции, сохраняет в выходной.
+ 
+Файл replace_spaces: #!/bin/bash
+if [ $# -ne 2 ]; then
+    echo "Usage: $0 <input_file> <output_file>"
+    exit 1
+fi
+sed 's/ /\t/g' "$1" > "$2"
+ 
+Разбор команды: sed 's/..../\t/g' — заменяет каждые 4 пробела на \t
+В кавычках sed четыре реальных пробела, потом \t — символ табуляции
+$1 — входной файл, $2 — выходной
+ 
+nano replace_spaces
+chmod +x replace_spaces
+# создаём файл с пробелами
+printf 'a b c\n' > input.txt
+# запускаем
+./replace_spaces input.txt output.txt
+# проверяем — должны быть табы, а не пробелы
+cat -A output.txt
+ 
+Вывод: a^Ib^Ic$
+ 
+ 
+Задача 10
+Программа берёт папку и выводит все пустые файлы в ней.
+ 
+Файл empty_files: #!/bin/bash
+if [ -z "$1" ]; then
+    echo "Usage: $0 <directory>"
+    exit 1
+fi
+find "$1" -type f -empty
+ 
+Разбор команды: find -type f — только файлы (не папки)
+-empty — только пустые
+ 
+nano empty_files
+chmod +x empty_files
+# создаём разные файлы
+mkdir empty_test
+touch empty_test/a.txt # пустой
+touch empty_test/b.txt # пустой
+echo "text" > empty_test/c.txt # непустой
+./empty_files empty_test
+ 
+Вывод: empty_test/a.txt
+empty_test/b.txt
