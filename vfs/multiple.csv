@@ -1,0 +1,6 @@
+path,type,content_base64
+/docs,dir,
+/docs/readme.txt,file,RG9jdW1lbnRhdGlvbg==
+/images,dir,
+/images/pixel.bin,file,AAH/
+/notes.txt,file,Tm90ZXM=
